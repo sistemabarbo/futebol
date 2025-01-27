@@ -1,0 +1,378 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Logs de Integração</title>
+    <style>
+        .main {
+            background-color: aliceblue;
+            border: 1px solid red;
+            display: flex;
+        }
+
+        .um {
+            flex: 50%;
+            text-align: center;
+            border: 1px solid blue;
+            padding: 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>Logs de Integração (Salesforce ↔ SAP B1)</h1>
+    <div id="content">
+
+    </div>
+    <div class="main">
+        <div class="um">
+            <h6>Logs de integração processados com sucesso</h6>
+            <h5 id="logs-sucesso-integrados">Aguardando...</h5>
+        </div>
+        <div class="um">
+            <h6>Com erros ou em execução</h6>
+            <h5 id="logs-erros-execucao">Aguardando...</h5>
+        </div>
+    </div>
+
+    <script>
+        const apiUrl = 'https://integracao.hospcom.net/consultaSql?sql=SELECT%20*%20FROM%20DBINTEGRATIONONE2.%22LastUpdateSap%22%20WHERE%20%22Entity%22%20=%20%27Faturamento%27%20AND%20%22DocEntry%22%20IN%20(14115,%2011342,%20137970,%2010229)';
+        const sapApiUrl = 'https://integracao.hospcom.net/consultaSql';
+        const salesforceApiUrl = 'https://integracao.hospcom.net/consulta/sales';
+
+        const contentDiv = document.getElementById('content');
+        const successDiv = document.getElementById('logs-sucesso-integrados');
+        const errorDiv = document.getElementById('logs-erros-execucao');
+
+        async function fetchData() {
+            try {
+                const response = await fetch(apiUrl);
+                if (!response.ok) throw new Error(`Erro: ${response.statusText}`);
+
+                const logs = await response.json();
+
+                if (!logs || logs.length === 0) {
+                    contentDiv.innerHTML += '<p class="message success">Nenhum log encontrado.</p>';
+                    return;
+                }
+
+                logs.forEach(log => {
+                    const updateTS = new Date(log.UpdateTS);
+                    if (isNaN(updateTS)) {
+                        console.error(`Data inválida para o log com DocEntry ${log.DocEntry}`);
+                        log.formattedDate = 'Data inválida';
+                        return;
+                    }
+
+                    const day = updateTS.getDate().toString().padStart(2, '0');
+                    const month = (updateTS.getMonth() + 1).toString().padStart(2, '0');
+                    const year = updateTS.getFullYear();
+
+                    log.formattedDate = `${day}-${month}-${year}`;
+                });
+                const successLogs1 = logs.filter(log => log.Integrated === true);
+                const errorLogs = logs.filter(log => log.Integrated === false);
+
+                // Gerar logs de sucesso
+                const successDetails = successLogs1.map(log => {
+                    const logText = `Tabela: ${log.Entity} DocEntry: ${log.DocEntry || log.CardCode} Data: ${log.formattedDate} Integrado: ${log.Integrated}`;
+                    return `<div style="background-color: green; color: white; margin: 5px; font-size: 18px; padding: 5px;">${logText}</div>`;
+                }).join("\n");
+
+                // Gerar logs de erro (logs com Integrated = false)
+                const errorDetails = errorLogs.map(log => {
+                    const logText = `Tabela: ${log.Entity} DocEntry: ${log.DocEntry || log.CardCode} Data: ${log.formattedDate} Integrado: ${log.Integrated} Log: ${log.Log}`;
+                    const backgroundColor = log.Log === null ? 'orange' : 'red';
+                    return `<div style="background-color: ${backgroundColor}; color: white; margin: 5px; padding: 5px;">${logText}</div>`;
+                }).sort((a, b) => {
+                    // Ordenando os logs para garantir que os logs com fundo vermelho apareçam primeiro
+                    if (a.includes('background-color: red') && !b.includes('background-color: red')) return -1;
+                    if (!a.includes('background-color: red') && b.includes('background-color: red')) return 1;
+                    return 0;
+                }).join("\n");
+
+                // Atualizar o conteúdo da div
+                if (successDetails) {
+                    successDiv.innerHTML += successDetails;
+                } else {
+                    successDiv.innerHTML += "<p>Nenhum log de sucesso encontrado.</p>";
+                }
+
+                if (errorDetails) {
+                    errorDiv.innerHTML += errorDetails;
+                } else {
+                    errorDiv.innerHTML += "<p>Nenhum erro encontrado.</p>";
+                }
+            } catch (error) {
+                console.error(error);
+                contentDiv.innerHTML += `<p class="message error">Erro ao carregar dados: ${error.message}</p>`;
+            }
+        }
+
+
+        async function fetchSapData() {
+            try {
+                const query = `SELECT * 
+FROM DBINTEGRATIONONE2.INVENTORYINTEGRATION 
+WHERE ONHAND <> 0 
+  AND INTEGRATED = FALSE
+
+UNION
+
+SELECT * 
+FROM DBINTEGRATIONONE2.INVENTORYINTEGRATION 
+WHERE ONHAND = 0 
+  AND ONORDER <> 0 
+  AND ISCOMMITED <> 0 
+  AND UPDATETS >= ADD_SECONDS(NOW(), -7200)`;
+                const response = await fetch(`${sapApiUrl}?sql=${encodeURIComponent(query)}`);
+
+                // Verifica o status da resposta
+                if (!response.ok) {
+                    throw new Error(`Erro ao buscar dados SAP: ${response.statusText}`);
+                }
+
+                // Verifica se o corpo da resposta contém algo
+                const textResponse = await response.text();
+                if (!textResponse) {
+                    throw new Error('Resposta do SAP está vazia.');
+                }
+
+                // Tenta converter o texto em JSON
+                try {
+                    return JSON.parse(textResponse);
+                } catch (err) {
+                    console.error('Erro ao converter resposta do SAP em JSON:', textResponse);
+                    throw new Error('Resposta do SAP não é um JSON válido.');
+                }
+            } catch (error) {
+                console.error('Erro na consulta SAP:', error);
+                return []; // Retorna um array vazio para evitar falhas subsequentes
+            }
+        }
+
+
+        async function fetchSalesforceData(itemCode, warehouseCode) {
+            try {
+                const query = `SELECT Id, Em_estoque__c, Confirmado__c, Pedido__c, 
+                               Estoque__r.Codigo__c, Produto__r.ProductCode 
+                               FROM Entrada_de_Estoque__c 
+                               WHERE Produto__r.ProductCode = '${itemCode}' 
+                               AND Estoque__r.Codigo__c = '${warehouseCode}'`;
+                               console.log("query", query)
+                const response = await fetch(`${salesforceApiUrl}?sql=${encodeURIComponent(query)}`);
+
+                if (!response.ok) {
+                    throw new Error(`Erro ao buscar dados Salesforce: ${response.statusText}`);
+                }
+
+                const textResponse = await response.text();
+                if (!textResponse) {
+                    throw new Error('Resposta do Salesforce está vazia.');
+                }
+
+                try {
+                    return JSON.parse(textResponse);
+                } catch (err) {
+                    console.error('Erro ao converter resposta do Salesforce em JSON:', textResponse);
+                    throw new Error('Resposta do Salesforce não é um JSON válido.');
+                }
+            } catch (error) {
+                console.error('Erro na consulta Salesforce:', error);
+                return [];
+            }
+        }
+
+
+        async function compareData() {
+            try {
+                const sapData = await fetchSapData();
+
+                if (!sapData.length) {
+                    console.error('Nenhum dado foi retornado do SAP.');
+                    errorDiv.textContent = 'Nenhum dado retornado do SAP.';
+                    return;
+                }
+
+                const errorLogs = [];
+
+                for (const sapItem of sapData) {
+                    const salesData = await fetchSalesforceData(sapItem.ITEMCODE, sapItem.WHSCODE);
+
+                    if (!salesData.length) {
+                        errorLogs.push({
+                            itemCode: sapItem.ITEMCODE,
+                            warehouseCode: sapItem.WHSCODE,
+                            onHand: sapItem.ONHAND,
+                            UPDATETS: sapItem.UPDATETS,
+                            sapData: sapItem,
+                            salesData: null,
+                            reason: "Dados ausentes no Salesforce",
+                        });
+                        continue;
+                    }
+
+                    const salesItem = salesData[0]; // Considera o primeiro item retornado
+                    console.log("dados", salesItem)
+                    const differences = {
+                        onHand: parseFloat(sapItem.ONHAND) !== parseFloat(salesItem.Em_estoque__c)
+                    };
+
+                    if (differences.onHand) {
+                        errorLogs.push({
+                            itemCode: sapItem.ITEMCODE,
+                            warehouseCode: sapItem.WHSCODE,
+                            onHand: sapItem.ONHAND,
+                            UPDATETS: sapItem.UPDATETS,
+                            sapData: sapItem,
+                            salesData: salesItem,
+                            differences,
+                        });
+                    }
+                }
+
+                if (errorLogs.length > 0) {
+                    // Gera relatórios de erros
+                    const errorDetails = errorLogs.map(log => {
+                        const salesValues = log.salesData || {};
+                        return `<div style="background-color: red; border: 3px solid green; color: white; margin: 5px; padding: 5px;">
+                                    Item: ${log.itemCode}, Estoque: ${log.warehouseCode}, 
+                                    Data: ${log.UPDATETS}, Quantidade SAP: ${log.onHand}, 
+                                    Quantidade Salesforce: ${salesValues.Em_estoque__c || 0}
+                                </div>`;
+                    }).join("\n");
+
+                    errorDiv.innerHTML += errorDetails;
+                } else {
+                    errorDiv.textContent = 'Todos os dados estão consistentes.';
+                }
+            } catch (error) {
+                console.error(error);
+                errorDiv.textContent = 'Erro ao comparar dados.';
+            }
+        }
+
+
+        compareData();
+
+
+
+
+        /* async function fetchSapData() {
+             try {
+                 const query = `SELECT ONHAND, ITEMCODE, WHSCODE, ISCOMMITED, ONORDER, UPDATETS 
+                        FROM DBINTEGRATIONONE2.INVENTORYINTEGRATION limit 1
+                        `;//WHERE ITEMCODE = '352/5855' AND WHSCODE = '153'
+                 const response = await fetch(`${sapApiUrl}?sql=${encodeURIComponent(query)}`);
+                 console.log("dados sap", response)
+                 if (!response.ok) throw new Error(`Erro ao buscar dados SAP: ${response.statusText}`);
+                 return await response.json();
+             } catch (error) {
+                 console.error(error);
+                 return [];
+             }
+         }
+ 
+         async function fetchSalesforceData(itemCode, warehouseCode) {
+             try {
+                 const query = `SELECT Id, Em_estoque__c, Confirmado__c, Pedido__c, 
+                        Estoque__r.Codigo__c, Produto__r.ProductCode 
+                        FROM Entrada_de_Estoque__c 
+                        WHERE Produto__r.ProductCode = '${itemCode}' 
+                        AND Estoque__r.Codigo__c = '${warehouseCode}'`;
+                 const response = await fetch(`${salesforceApiUrl}?sql=${encodeURIComponent(query)}`);
+                 console.log("dados sales", response)
+                 if (!response.ok) throw new Error(`Erro ao buscar dados Salesforce: ${response.statusText}`);
+                 return await response.json();
+             } catch (error) {
+                 console.error(error);
+                 return [];
+             }
+         }
+ 
+         async function compareData() {
+             try {
+                 const sapData = await fetchSapData();
+                 console.log("sap data", sapData)
+                 const errorLogs = [];
+ 
+ 
+                 for (const sapItem of sapData) {
+                     const salesData = await fetchSalesforceData(sapItem.ITEMCODE, sapItem.WHSCODE);
+                     const salesItem = salesData[0]; // Pega o primeiro item do Salesforce, se existir
+                     console.log("dados", salesItem)
+                     if (!salesItem) {
+                         errorLogs.push({
+                             itemCode: sapItem.ITEMCODE,
+                             warehouseCode: sapItem.WHSCODE,
+                             onHand: sapItem.ONHAND,
+                             UPDATETS: sapItem.UPDATETS,
+                             sapData: sapItem,
+                             salesData: null,
+                             reason: "Dados ausentes no Salesforce",
+                         });
+                         continue;
+                     }
+ 
+                     const differences = {
+                         onHand: parseFloat(sapItem.ONHAND) !== parseFloat(salesItem.Em_estoque__c),
+                         isCommitted: parseFloat(sapItem.ISCOMMITED) !== parseFloat(salesItem.Confirmado__c),
+                         onOrder: parseFloat(sapItem.ONORDER) !== parseFloat(salesItem.Pedido__c),
+                     };
+ 
+                     if (differences.onHand || differences.isCommitted || differences.onOrder) {
+                         errorLogs.push({
+                             itemCode: sapItem.ITEMCODE,
+                             warehouseCode: sapItem.WHSCODE,
+                             onHand: sapItem.ONHAND,
+                             UPDATETS: sapItem.UPDATETS,
+                             sapData: sapItem,
+                             salesData: salesItem,
+                             differences,
+                         });
+                     }
+                 }
+ 
+                 // Exibir apenas os logs de dados diferentes
+                 if (errorLogs.length > 0) {
+ 
+                     const errorDetails = errorLogs.map(log => {
+                         const salesValues = log.salesData || {};
+                         console.log("salesValues", salesValues.Em_estoque__c)
+                         const logText = `Item: ${log.itemCode} Estoque: ${log.warehouseCode} Data: ${log.UPDATETS} Quantidade sap: ${log.onHand} Quantidade sales: ${salesValues.Em_estoque__c}`;
+                         return `<div style="background-color: red; border: 3px solid green; color: white; margin: 5px; padding: 5px;">${logText}</div>`;
+                     }).sort((a, b) => {
+                         // Ordenando os logs para garantir que os logs com fundo vermelho apareçam primeiro
+                         if (a.includes('color: white') && !b.includes('color: white')) return -1;
+                         if (!a.includes('color: white') && b.includes('color: white')) return 1;
+                         return 0;
+                     }).join("\n");
+ 
+ 
+                     errorDiv.innerHTML += errorDetails;
+ 
+                 } else {
+                     errorDiv.textContent = 'Todos os dados estão consistentes.';
+                 }
+             } catch (error) {
+                 console.error(error);
+                 errorDiv.textContent = 'Erro ao comparar dados.';
+             }
+         }
+ 
+         compareData();*/
+         function startPolling() {
+            fetchData();
+            compareData();
+           // setInterval(fetchData, 300);
+        }
+        startPolling();
+
+       // fetchData();
+        // compareData();
+    </script>
+</body>
+
+</html>
